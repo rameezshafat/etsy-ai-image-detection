@@ -230,21 +230,36 @@ def _replace_head_and_get_dim(model: nn.Module, model_name: str) -> tuple[nn.Mod
 
 
 def build_pretrained_backbone(model_name: str = "efficientnet_b0", pretrained: bool = True) -> ModelBundle:
+    def _safe_weights(default_weights):
+        return default_weights if pretrained else None
+
+    def _build_with_fallback(builder, weights):
+        try:
+            return builder(weights=weights)
+        except Exception as exc:
+            if weights is not None:
+                print(
+                    f"Warning: failed to load pretrained weights for {model_name}. "
+                    f"Falling back to randomly initialized weights. Details: {exc}"
+                )
+                return builder(weights=None)
+            raise
+
     if model_name == "resnet50":
-        weights = models.ResNet50_Weights.DEFAULT if pretrained else None
-        backbone = models.resnet50(weights=weights)
+        weights = _safe_weights(models.ResNet50_Weights.DEFAULT)
+        backbone = _build_with_fallback(models.resnet50, weights)
     elif model_name == "efficientnet_b0":
-        weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
-        backbone = models.efficientnet_b0(weights=weights)
+        weights = _safe_weights(models.EfficientNet_B0_Weights.DEFAULT)
+        backbone = _build_with_fallback(models.efficientnet_b0, weights)
     elif model_name == "efficientnet_b2":
-        weights = models.EfficientNet_B2_Weights.DEFAULT if pretrained else None
-        backbone = models.efficientnet_b2(weights=weights)
+        weights = _safe_weights(models.EfficientNet_B2_Weights.DEFAULT)
+        backbone = _build_with_fallback(models.efficientnet_b2, weights)
     elif model_name == "efficientnet_b3":
-        weights = models.EfficientNet_B3_Weights.DEFAULT if pretrained else None
-        backbone = models.efficientnet_b3(weights=weights)
+        weights = _safe_weights(models.EfficientNet_B3_Weights.DEFAULT)
+        backbone = _build_with_fallback(models.efficientnet_b3, weights)
     elif model_name == "vit_b_16":
-        weights = models.ViT_B_16_Weights.DEFAULT if pretrained else None
-        backbone = models.vit_b_16(weights=weights)
+        weights = _safe_weights(models.ViT_B_16_Weights.DEFAULT)
+        backbone = _build_with_fallback(models.vit_b_16, weights)
     else:
         raise ValueError(f"Unsupported model_name: {model_name}")
 
