@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -54,6 +55,39 @@ def build_eval_transforms(image_size: int = 224) -> transforms.Compose:
     return transforms.Compose(
         [
             transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+
+class RandomJPEGCompression:
+    """PIL transform: randomly apply JPEG compression to simulate real-world encoding artifacts."""
+
+    def __init__(self, quality_min: int = 65, quality_max: int = 95, p: float = 0.3) -> None:
+        self.quality_min = quality_min
+        self.quality_max = quality_max
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() >= self.p:
+            return img
+        quality = random.randint(self.quality_min, self.quality_max)
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=quality)
+        buffer.seek(0)
+        return Image.open(buffer).convert("RGB")
+
+
+def build_augmented_train_transforms(image_size: int = 224) -> transforms.Compose:
+    """Train transforms with JPEG compression simulation for AI-artifact robustness."""
+    return transforms.Compose(
+        [
+            transforms.Resize((image_size + 32, image_size + 32)),
+            transforms.RandomCrop((image_size, image_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.02),
+            RandomJPEGCompression(quality_min=70, quality_max=95, p=0.3),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
@@ -208,6 +242,9 @@ class EmbeddingClassifier(nn.Module):
 
     def forward(self, image: torch.Tensor, handcrafted: torch.Tensor | None = None) -> torch.Tensor:
         features = self.backbone(image)
+        # ViT's MultiheadAttention can produce non-contiguous tensors after
+        # internal transpose ops. .contiguous() is a no-op for EfficientNet.
+        features = features.contiguous()
         if handcrafted is not None:
             features = torch.cat([features, handcrafted], dim=1)
         return self.classifier(features).squeeze(1)
@@ -289,6 +326,27 @@ def build_encoder_model(model_name: str = "vit_b_16", pretrained: bool = True, h
     bundle = build_pretrained_backbone(model_name=model_name, pretrained=pretrained)
     model = EmbeddingClassifier(bundle.model, bundle.feature_dim, handcrafted_dim=handcrafted_dim)
     return ModelBundle(model=model, model_name=f"encoder_{model_name}", input_size=bundle.input_size, feature_dim=bundle.feature_dim)
+
+
+def get_discriminative_param_groups(
+    model: nn.Module,
+    head_lr: float,
+    backbone_lr_factor: float = 0.1,
+) -> list[dict]:
+    """Return AdamW param groups with a lower LR for the backbone than the classifier head.
+
+    The classifier head gets ``head_lr``; all other trainable parameters get
+    ``head_lr * backbone_lr_factor``.  This prevents catastrophic forgetting of
+    pretrained features while still allowing fine-tuning.
+    """
+    head_params = list(model.classifier.parameters())
+    head_ids = {id(p) for p in head_params}
+    backbone_params = [p for p in model.parameters() if id(p) not in head_ids and p.requires_grad]
+    head_trainable = [p for p in head_params if p.requires_grad]
+    return [
+        {"params": backbone_params, "lr": head_lr * backbone_lr_factor},
+        {"params": head_trainable, "lr": head_lr},
+    ]
 
 
 def freeze_backbone(model: nn.Module) -> None:
@@ -463,6 +521,36 @@ def predict_probabilities(model: nn.Module, data_loader: DataLoader, *, device: 
             logits = forward_batch(model, batch)
             all_probs.append(torch.sigmoid(logits).cpu().numpy())
     return np.concatenate(all_probs)
+
+
+def predict_logits(model: nn.Module, data_loader: DataLoader, *, device: torch.device) -> np.ndarray:
+    """Return raw pre-sigmoid logits for binary classification (needed for temperature scaling)."""
+    model.eval()
+    all_logits: list[np.ndarray] = []
+    with torch.inference_mode():
+        for batch in data_loader:
+            batch = _batch_to_device(batch, device)
+            logits = forward_batch(model, batch)
+            all_logits.append(logits.cpu().numpy())
+    return np.concatenate(all_logits)
+
+
+def predict_with_tta(model: nn.Module, data_loader: DataLoader, *, device: torch.device) -> np.ndarray:
+    """Predict probabilities using test-time augmentation (original + horizontal flip averaged)."""
+    probs_orig = predict_probabilities(model, data_loader, device=device)
+    model.eval()
+    all_probs_flipped: list[np.ndarray] = []
+    with torch.inference_mode():
+        for batch in data_loader:
+            batch = _batch_to_device(batch, device)
+            flipped: dict = {k: v for k, v in batch.items()}
+            flipped["image"] = torch.flip(batch["image"], dims=[-1])
+            if "fft_image" in flipped:
+                flipped["fft_image"] = torch.flip(batch["fft_image"], dims=[-1])
+            logits = forward_batch(model, flipped)
+            all_probs_flipped.append(torch.sigmoid(logits).cpu().numpy())
+    probs_flipped = np.concatenate(all_probs_flipped)
+    return (probs_orig + probs_flipped) / 2.0
 
 
 def build_submission(records: pd.DataFrame, probabilities: np.ndarray, threshold: float) -> pd.DataFrame:
