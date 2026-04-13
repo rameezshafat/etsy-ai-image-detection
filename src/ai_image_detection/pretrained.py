@@ -94,6 +94,36 @@ def build_augmented_train_transforms(image_size: int = 224) -> transforms.Compos
     )
 
 
+def build_fft_train_transforms(image_size: int = 224) -> transforms.Compose:
+    """Train transforms for log-magnitude FFT spectra.
+
+    Uses the same ImageNet normalisation as the RGB branch so the pretrained
+    EfficientNet backbone receives activations in its expected range.  Colour
+    jitter is deliberately omitted — spectra are greyscale-derived and
+    channel-wise colour shifts have no physical meaning there.
+    """
+    return transforms.Compose(
+        [
+            transforms.Resize((image_size + 32, image_size + 32)),
+            transforms.RandomCrop((image_size, image_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+
+def build_fft_eval_transforms(image_size: int = 224) -> transforms.Compose:
+    """Eval transforms for log-magnitude FFT spectra."""
+    return transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+
 def _bytes_to_tensor(path: Path) -> torch.Tensor:
     return torch.tensor([path.stat().st_size / 1024.0], dtype=torch.float32)
 
@@ -149,6 +179,7 @@ class FineTuneImageDataset(Dataset):
         image_transform: Callable,
         target_column: str | None = "ground_truth",
         include_fft_image: bool = False,
+        fft_transform: Callable | None = None,
         include_handcrafted: bool = False,
         perturbation: str | None = None,
     ) -> None:
@@ -156,6 +187,9 @@ class FineTuneImageDataset(Dataset):
         self.image_transform = image_transform
         self.target_column = target_column if target_column in self.records.columns else None
         self.include_fft_image = include_fft_image
+        # Fall back to the RGB transform when no FFT-specific transform is given,
+        # preserving backward-compatibility with existing call sites.
+        self.fft_transform = fft_transform if fft_transform is not None else image_transform
         self.include_handcrafted = include_handcrafted
         self.perturbation = perturbation
 
@@ -197,7 +231,7 @@ class FineTuneImageDataset(Dataset):
                 "image_id": row["image_id"],
             }
             if self.include_fft_image:
-                batch["fft_image"] = self.image_transform(self._make_fft_image(img))
+                batch["fft_image"] = self.fft_transform(self._make_fft_image(img))
             if self.include_handcrafted:
                 batch["handcrafted"] = torch.tensor(_extract_handcrafted_features(image_path), dtype=torch.float32)
 
@@ -411,6 +445,36 @@ def evaluate_predictions(y_true: np.ndarray, probabilities: np.ndarray, threshol
         "accuracy": accuracy_score(y_true, preds),
         "confusion_matrix": confusion_matrix(y_true, preds),
     }
+
+
+class FocalLoss(nn.Module):
+    """Binary Focal Loss (Lin et al., 2017) operating on raw logits.
+
+    Focal Loss down-weights well-classified examples so training focuses on
+    the hard ones.  With ``gamma=0`` it reduces to standard BCE; increasing
+    ``gamma`` increases the focusing effect.
+
+    ``alpha`` is the positive-class weight (balancing factor).  Tuning it
+    alongside ``gamma`` typically yields better precision–recall trade-offs
+    than plain BCE on near-balanced datasets.
+
+    Args:
+        alpha: weight applied to the positive class (ai_generated).
+               A value of 0.25 slightly emphasises the minority class.
+        gamma: focusing exponent.  Recommended range: 1–3.
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        return (alpha_t * (1.0 - p_t) ** self.gamma * bce).mean()
 
 
 def run_epoch(
